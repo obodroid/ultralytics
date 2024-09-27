@@ -8,12 +8,14 @@ import numpy as np
 import torch.nn as nn
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
 from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
+from pathlib import Path
 
 
 class DetectionTrainer(BaseTrainer):
@@ -30,7 +32,7 @@ class DetectionTrainer(BaseTrainer):
         ```
     """
 
-    def build_dataset(self, img_path, mode="train", batch=None):
+    def build_dataset(self, img_path, mode="train", batch=None, pastein_dataset=None):
         """
         Build YOLO Dataset.
 
@@ -40,17 +42,82 @@ class DetectionTrainer(BaseTrainer):
             batch (int, optional): Size of batches, this is for `rect`. Defaults to None.
         """
         gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, pastein_dataset=pastein_dataset)
+
+    def build_pastein_dataset(self):
+        class dotdict(dict):
+            """dot.notation access to dictionary attributes"""
+            __getattr__ = dict.get
+            __setattr__ = dict.__setitem__
+            __delattr__ = dict.__delitem__
+
+        # TODO this was copied from train_Config, filter out unused config later
+        segmentation_dataset_config = {
+         'task': "segment",
+         'cache': None,
+         'batch': 8,
+         'imgsz': 1280,
+         'cache': False,
+         'device': 0,
+         'workers': 8,
+         'name': 'None',
+         'seed': 0,
+         'deterministic': False,
+         'box': 7.5,
+         'cls': 0.5,
+         'dfl': 1.5,
+         'pose': 12.0,
+         'kobj': 1.0,
+         'label_smoothing': 0.0,
+         'nbs': 64,
+         'overlap_mask': True,
+         'mask_ratio': 4,
+         'dropout': 0.0,
+         'val': True,
+         'plots': True,
+         'auto_augment': 'augmix',
+         'hsv_h': 0.015,
+         'hsv_s': 0.7,
+         'hsv_v': 0.4,
+         'degrees': 0.0,
+         'translate': 0.1,
+         'scale': 0.1,
+         'shear': 0.0,
+         'perspective': 0.0,
+         'flipud': 0.0,
+         'fliplr': 0.5,
+         'bgr': 0.0,
+         'mosaic': 0.0,
+         'mixup': 0.0,
+         'copy_paste': 1.0,
+         'erasing': 0.0,
+         'crop_fraction': 1.0}
+
+        segment_dir = Path("/home/boat/obo-mlcv-script/YOLO/datasets/segment-person_science-of-university_v1")
+        
+        segmentation_dataset = build_yolo_dataset(dotdict(segmentation_dataset_config), 
+                        img_path=segment_dir,
+                        batch=1,
+                        data=check_det_dataset(segment_dir / "data.yaml"),
+                        mode="val",
+                        )
+
+        return segmentation_dataset
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
         """Construct and return dataloader."""
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
+
+        LOGGER.warning("WARNING ⚠️ Loading Past-in dataset for pastein augmentation. This is to be refactored properly!!!")
+        pastein_dataset = self.build_pastein_dataset()
+
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-            dataset = self.build_dataset(dataset_path, mode, batch_size)
+            dataset = self.build_dataset(dataset_path, mode, batch_size, pastein_dataset=pastein_dataset)
         shuffle = mode == "train"
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("WARNING ⚠️ 'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        
         workers = self.args.workers if mode == "train" else self.args.workers * 2
         return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
 

@@ -17,6 +17,14 @@ from ultralytics.utils.instance import Instances
 from ultralytics.utils.metrics import bbox_ioa
 from ultralytics.utils.ops import segment2box, xyxyxyxy2xywhr
 from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TORCHVISION_0_13
+from copy import deepcopy
+import sys
+import matplotlib.pyplot as plt
+import os
+import shutil
+import cv2
+from pathlib import Path
+import yaml
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
@@ -1627,6 +1635,191 @@ class LetterBox:
         labels["instances"].add_padding(padw, padh)
         return labels
 
+class PasteIn:
+    def __init__(self, pastein_dataset, p=0.5, imgsz_factor=1.0):
+        """
+        Paste-In augmentation: randomly copy a segment from segmentation dataset to target image
+        Arguments:
+        p : float (probability of augmentation)
+        segment_dir : Path (path of segmentation dataset (must be in yolov8 segmentation format))
+        """
+        self.segmentation_dataset = deepcopy(pastein_dataset)
+        seg_yaml_path = Path(pastein_dataset.img_path) / "data.yaml"
+        LOGGER.info("pastein dataset yaml path : "+ str(seg_yaml_path))
+        self.seg_yaml = yaml.safe_load(open(seg_yaml_path, 'r'))
+        self.p = p
+        self.target_cls_names = {i:j for i,j in enumerate(["Forklift", "Uniform", "person"])}
+        LOGGER.warning("WARNING ⚠️ PastIn augmentation target_cls_names is hard-coded to " + str(list(self.target_cls_names.values())) + ". Must be fixed later!")
+        self.inv_target_cls_names = {j:i for i,j in self.target_cls_names.items()}
+        self.src_cls_names = {i:j for i,j in enumerate(self.seg_yaml["names"])}
+        self.imgsz_factor = imgsz_factor
+
+    def upper_left_crop(self, image, crop_width, crop_height):
+        h, w, _ = image.shape
+    
+        x2 = min(crop_width, w)
+        y2 = min(crop_height, h)
+    
+        cropped_image = image[0:y2, 0:x2]
+    
+        return cropped_image
+
+    def lower_right_crop(self, image, crop_width, crop_height):
+        h, w, _ = image.shape
+        
+        x1 = max(w - crop_width, 0)
+        y1 = max(h - crop_height, 0)
+        
+        # Crop the image from the calculated point to the bottom-right corner of the image
+        cropped_image = image[y1:h, x1:w]
+        
+        return cropped_image
+
+    def fit_frame_black(self, image, w, h):
+        assert isinstance(image, np.ndarray)
+        res = np.zeros((h, w, image.shape[-1]), np.uint8)
+        res[0:image.shape[0], 0:image.shape[1], :] = image
+        return res
+
+    def imshow(self, im):
+        if self.debug:
+            plt.imshow(im[:,:,::-1])
+            plt.show()
+
+    def print(self, *a):
+        if self.debug: print(*a)
+
+    def map_array(self, arr, mapping):
+        # Create a function that applies the mapping dictionary
+        map_func = np.vectorize(lambda x: mapping.get(x, x))  # Default to returning the original value if not in map
+        return map_func(arr)
+
+    def map_seg_classes_to_target(self, seg_cls):
+        seg_names = self.map_array(seg_cls, self.src_cls_names)
+        mapped_cls = self.map_array(seg_names, self.inv_target_cls_names)
+        return mapped_cls
+        
+    def __call__(self, labels):
+        debug_id = labels["im_file"].split("/")[-1][-8:]
+
+        """
+        Applies Paste-In augmentation to an image and its instances.
+
+        Args:
+            labels (Dict): A dictionary containing:
+                - 'img' (np.ndarray): The image to augment.
+                - 'cls' (np.ndarray): Class labels for the instances.
+                - 'instances' (ultralytics.engine.results.Instances): Object containing bounding boxes, segments, etc.
+
+        Returns:
+            (Dict): Dictionary with augmented image and updated instances under 'img', 'cls', and 'instances' keys.
+        """
+        # for debugging
+        self.debug = False
+
+        # unpack labels
+        im = labels["img"]
+        cls = labels["cls"]
+        h, w = im.shape[:2]
+        instances = labels.pop("instances")
+        instances_segment_shape = instances.segments.shape
+        instance_segment_len = len(instances.segments)
+        instances.convert_bbox(format="xyxy")
+        instances.denormalize(w, h)
+        self.imshow(im)
+            
+        # random select source index & get labels
+        patient = 5
+        count = 0
+        src_instances_segment_len = 0
+        while (src_instances_segment_len == 0) or count == patient: 
+            src_idx = random.randint(0, len(self.segmentation_dataset) - 1)
+            self.print("src_idx", src_idx)
+            src_labels = self.segmentation_dataset.get_image_and_label(src_idx)
+            src_instances_segment_len = len(src_labels["instances"].segments)
+            count += 1
+
+        if src_instances_segment_len == 0: 
+            labels["instances"] = instances
+            return labels # no augment if sampled data has no segments
+
+        src_instances = src_labels["instances"]
+        self.print("src_instances segment size", len(src_instances.segments))
+        
+        sh, sw = src_labels["img"].shape[:2]
+        self.print("segments maxxy b4",  np.max(src_instances.segments[:,:,0]),  np.max(src_instances.segments[:,:,1]))
+        self.imshow(src_labels["img"])
+        self.print("sh, sw", sh, sw)
+        self.print("h, w", h, w)
+
+        # preprocess src img to match target img width and height (resize, crop, and expand)
+        src_im = src_labels["img"]
+        src_im = cv2.resize(src_im, (int(round(src_im.shape[1] * self.imgsz_factor)), int(round(src_im.shape[0] * self.imgsz_factor))))
+        src_im = self.upper_left_crop(src_labels["img"], w, h)
+        src_im = self.fit_frame_black(src_im, w, h)
+
+        # map src cls to target cls
+        src_cls = src_labels["cls"]
+        src_cls = self.map_seg_classes_to_target(src_cls)
+
+        # clip segments and bboxes in instances TODO: clipped bbox is not tight, must recompute bbox from clipped segment
+        src_instances.convert_bbox(format="xyxy")
+        self.print("bboxes1", src_instances.bboxes)
+        src_instances.denormalize(sw, sh)
+        self.print("src_instances.segments", src_instances.segments)
+        self.print("bboxes2", src_instances.bboxes)
+        src_instances.segments[:,:,0] = np.clip(src_instances.segments[:,:,0], 0, w - 1)
+        src_instances.segments[:,:,1] = np.clip(src_instances.segments[:,:,1], 0, h - 1)
+        self.print("src_instances.segments",src_instances.segments)
+        bboxes_clip = src_instances.bboxes
+        self.print("bboxes",src_instances.bboxes)
+        bboxes_clip[:,0] = np.clip(src_instances.bboxes[:,0], 0.0, w - 1)
+        bboxes_clip[:,2] = np.clip(src_instances.bboxes[:,2], 0.0, w - 1)
+        bboxes_clip[:,1] = np.clip(src_instances.bboxes[:,1], 0.0, h - 1)
+        bboxes_clip[:,3] = np.clip(src_instances.bboxes[:,3], 0.0, h - 1)
+        self.print("bboxes_clip",bboxes_clip)
+        src_instances = Instances(deepcopy(bboxes_clip), deepcopy(src_instances.segments), bbox_format = "xyxy", normalized = False)
+        self.print("src_cls", src_cls)
+        self.print(src_instances.segments.shape)
+        self.print("segments maxxy af",  np.max(src_instances.segments[:,:,0]),  np.max(src_instances.segments[:,:,1]))
+        self.imshow(src_im)
+
+        # perform paste-in
+        if self.p and len(src_instances.segments):
+            _, w, _ = im.shape  # height, width, channels
+            im_new = np.zeros(im.shape, np.uint8)
+
+            ioa = bbox_ioa(src_instances.bboxes, instances.bboxes)  # intersection over area, (N, M)
+            self.print("ioa",ioa)
+            indexes = np.nonzero((ioa < 0.99).all(1))[0]  # (N, )
+            self.print("indexes",indexes)
+            n = len(indexes)
+            for j in random.sample(list(indexes), k=round(self.p * n)):
+                cls = np.concatenate((cls, src_cls[[j]]), axis=0)
+                cv2.drawContours(im_new, src_instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
+                # print("instances.segments", instances.segments)
+                instances = Instances.concatenate((instances, src_instances[[j]]), axis=0)
+
+            result = src_im
+            i = im_new.astype(bool)
+            im[i] = result[i]
+        
+        # TODO remove
+        plt.imsave(Path("temp") / Path(labels["im_file"]).name, im[:,:,::-1])
+
+        # # assign stufss back to labels object
+        labels["img"] = im
+        labels["cls"] = cls
+        # print("b4 segment erase len", len(instances.segments), type(instances.segments), instances.segments.shape)
+        instances.segments = np.empty(instances_segment_shape)
+        # print("after segment erase len", len(instances.segments), type(instances.segments), instances.segments.shape)
+        # assert len(instances) == len(cls)
+        # # instances.normalize(w,h)
+        # # instances.convert_bbox(format="xywh")
+
+        labels["instances"] = instances
+        # print("pastein return", labels, labels["instances"])
+        return labels
 
 class CopyPaste:
     """
@@ -2257,7 +2450,7 @@ class RandomLoadText:
         return labels
 
 
-def v8_transforms(dataset, imgsz, hyp, stretch=False):
+def v8_transforms(dataset, imgsz, hyp, stretch=False, pastein_dataset=None):
     """
     Applies a series of image transformations for YOLOv8 training.
 
@@ -2280,8 +2473,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
         >>> augmented_data = transforms(dataset[0])
     """
-    pre_transform = Compose(
-        [
+    pre_transform_list = [
             Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
             CopyPaste(p=hyp.copy_paste),
             RandomPerspective(
@@ -2293,7 +2485,17 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
                 pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
             ),
         ]
-    )
+    
+    if pastein_dataset:
+        pre_transform_list.insert(2, PasteIn(
+            pastein_dataset,
+            p=1.0,
+            imgsz_factor=0.4,
+            )
+        )
+
+    pre_transform = Compose(pre_transform_list)
+
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
     if dataset.use_keypoints:
         kpt_shape = dataset.data.get("kpt_shape", None)
