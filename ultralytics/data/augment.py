@@ -1648,7 +1648,7 @@ class PasteIn:
         LOGGER.info("pastein dataset yaml path : "+ str(seg_yaml_path))
         self.seg_yaml = yaml.safe_load(open(seg_yaml_path, 'r'))
         self.p = p
-        self.target_cls_names = {i:j for i,j in enumerate(["Forklift", "Uniform", "person"])}
+        self.target_cls_names = {i:j for i,j in enumerate(["person", "Forklift", "Uniform"])}
         LOGGER.warning("WARNING ⚠️ PastIn augmentation target_cls_names is hard-coded to " + str(list(self.target_cls_names.values())) + ". Must be fixed later!")
         self.inv_target_cls_names = {j:i for i,j in self.target_cls_names.items()}
         self.src_cls_names = {i:j for i,j in enumerate(self.seg_yaml["names"])}
@@ -1677,9 +1677,12 @@ class PasteIn:
 
     def fit_frame_black(self, image, w, h):
         assert isinstance(image, np.ndarray)
+        offset_w = random.randint(0, w - image.shape[1])
+        offset_h = random.randint(0, h - image.shape[0])
+        
         res = np.zeros((h, w, image.shape[-1]), np.uint8)
-        res[0:image.shape[0], 0:image.shape[1], :] = image
-        return res
+        res[offset_h:(image.shape[0] + offset_h), offset_w:(image.shape[1] + offset_w), :] = image
+        return res, offset_h, offset_w
 
     def imshow(self, im):
         if self.debug:
@@ -1727,7 +1730,7 @@ class PasteIn:
         instances.convert_bbox(format="xyxy")
         instances.denormalize(w, h)
         self.imshow(im)
-            
+        
         # random select source index & get labels
         patient = 5
         count = 0
@@ -1754,9 +1757,10 @@ class PasteIn:
 
         # preprocess src img to match target img width and height (resize, crop, and expand)
         src_im = src_labels["img"]
-        src_im = cv2.resize(src_im, (int(round(src_im.shape[1] * self.imgsz_factor)), int(round(src_im.shape[0] * self.imgsz_factor))))
-        src_im = self.upper_left_crop(src_labels["img"], w, h)
-        src_im = self.fit_frame_black(src_im, w, h)
+        scalew, scaleh = (int(round(src_im.shape[1] * self.imgsz_factor)), int(round(src_im.shape[0] * self.imgsz_factor)))
+        src_im = cv2.resize(src_im, (scalew, scaleh))
+        src_im= self.upper_left_crop(src_im, w, h)
+        src_im, offset_h, offset_w  = self.fit_frame_black(src_im, w, h)
 
         # map src cls to target cls
         src_cls = src_labels["cls"]
@@ -1765,14 +1769,22 @@ class PasteIn:
         # clip segments and bboxes in instances TODO: clipped bbox is not tight, must recompute bbox from clipped segment
         src_instances.convert_bbox(format="xyxy")
         self.print("bboxes1", src_instances.bboxes)
-        src_instances.denormalize(sw, sh)
+        src_instances.denormalize(scalew, scaleh)
         self.print("src_instances.segments", src_instances.segments)
         self.print("bboxes2", src_instances.bboxes)
+        
+        src_instances.segments[:,:,0] = src_instances.segments[:,:,0] + offset_w
+        src_instances.segments[:,:,1] = src_instances.segments[:,:,1] + offset_h  
         src_instances.segments[:,:,0] = np.clip(src_instances.segments[:,:,0], 0, w - 1)
         src_instances.segments[:,:,1] = np.clip(src_instances.segments[:,:,1], 0, h - 1)
+        
         self.print("src_instances.segments",src_instances.segments)
         bboxes_clip = src_instances.bboxes
         self.print("bboxes",src_instances.bboxes)
+        bboxes_clip[:,0] = bboxes_clip[:,0] + offset_w
+        bboxes_clip[:,2] = bboxes_clip[:,2] + offset_w
+        bboxes_clip[:,1] = bboxes_clip[:,1] + offset_h
+        bboxes_clip[:,3] = bboxes_clip[:,3] + offset_h
         bboxes_clip[:,0] = np.clip(src_instances.bboxes[:,0], 0.0, w - 1)
         bboxes_clip[:,2] = np.clip(src_instances.bboxes[:,2], 0.0, w - 1)
         bboxes_clip[:,1] = np.clip(src_instances.bboxes[:,1], 0.0, h - 1)
@@ -1805,7 +1817,8 @@ class PasteIn:
             im[i] = result[i]
         
         # TODO remove
-        plt.imsave(Path("temp") / Path(labels["im_file"]).name, im[:,:,::-1])
+        # plt.imsave(Path("temp") / Path(labels["im_file"]).name, im[:,:,::-1])
+        self.imshow(im)
 
         # # assign stufss back to labels object
         labels["img"] = im
@@ -1814,8 +1827,8 @@ class PasteIn:
         instances.segments = np.empty(instances_segment_shape)
         # print("after segment erase len", len(instances.segments), type(instances.segments), instances.segments.shape)
         # assert len(instances) == len(cls)
-        # # instances.normalize(w,h)
-        # # instances.convert_bbox(format="xywh")
+        # instances.normalize(w,h)
+        # instances.convert_bbox(format="xywh")
 
         labels["instances"] = instances
         # print("pastein return", labels, labels["instances"])
@@ -2490,7 +2503,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False, pastein_dataset=None):
         pre_transform_list.insert(2, PasteIn(
             pastein_dataset,
             p=1.0,
-            imgsz_factor=0.4,
+            imgsz_factor=0.5,
             )
         )
 
