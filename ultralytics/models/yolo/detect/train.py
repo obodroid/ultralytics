@@ -93,12 +93,13 @@ class DetectionTrainer(BaseTrainer):
          'erasing': 0.0,
          'crop_fraction': 1.0}
 
-        segment_dir = Path("/home/boat/obo-mlcv-script/YOLO/datasets/segment-person_science-of-university_v1")
+        # segment_dir = Path("/home/boat/obo-mlcv-script/YOLO/datasets/segment-person_science-of-university_v1")
+        paste_in_dataset_dir = Path(self.args.paste_in_dataset)
         
         segmentation_dataset = build_yolo_dataset(dotdict(segmentation_dataset_config), 
-                        img_path=segment_dir,
+                        img_path=paste_in_dataset_dir,
                         batch=1,
-                        data=check_det_dataset(segment_dir / "data.yaml"),
+                        data=check_det_dataset(paste_in_dataset_dir / "data.yaml"),
                         mode="val",
                         )
 
@@ -108,8 +109,10 @@ class DetectionTrainer(BaseTrainer):
         """Construct and return dataloader."""
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
 
-        LOGGER.warning("WARNING ⚠️ Loading Past-in dataset for pastein augmentation. This is to be refactored properly!!!")
-        pastein_dataset = self.build_pastein_dataset()
+        pastein_dataset = None
+        if self.args.paste_in_dataset:
+            LOGGER.info("Loading Paste-in segmentation dataset from " + self.args.paste_in_dataset)
+            pastein_dataset = self.build_pastein_dataset()
 
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
             dataset = self.build_dataset(dataset_path, mode, batch_size, pastein_dataset=pastein_dataset)

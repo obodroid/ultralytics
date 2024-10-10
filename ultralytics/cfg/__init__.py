@@ -132,6 +132,8 @@ CFG_FRACTION_KEYS = {  # fractional float arguments with 0.0<=values<=1.0
     "mosaic",
     "mixup",
     "copy_paste",
+    "paste_in"
+    "paste_in_factor"
     "conf",
     "iou",
     "fraction",

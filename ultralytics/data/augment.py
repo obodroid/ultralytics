@@ -1636,7 +1636,7 @@ class LetterBox:
         return labels
 
 class PasteIn:
-    def __init__(self, pastein_dataset, p=0.5, imgsz_factor=1.0):
+    def __init__(self, pastein_dataset, target_dataset, p=0.5, imgsz_factor=1.0):
         """
         Paste-In augmentation: randomly copy a segment from segmentation dataset to target image
         Arguments:
@@ -1644,15 +1644,13 @@ class PasteIn:
         segment_dir : Path (path of segmentation dataset (must be in yolov8 segmentation format))
         """
         self.segmentation_dataset = deepcopy(pastein_dataset)
-        seg_yaml_path = Path(pastein_dataset.img_path) / "data.yaml"
-        LOGGER.info("pastein dataset yaml path : "+ str(seg_yaml_path))
-        self.seg_yaml = yaml.safe_load(open(seg_yaml_path, 'r'))
         self.p = p
-        self.target_cls_names = {i:j for i,j in enumerate(["person", "Forklift", "Uniform"])}
-        LOGGER.warning("WARNING ⚠️ PastIn augmentation target_cls_names is hard-coded to " + str(list(self.target_cls_names.values())) + ". Must be fixed later!")
+        self.target_cls_names = target_dataset.data["names"]
+        LOGGER.info("Segmentation class are " + str(list(self.target_cls_names.values())) + ".")
         self.inv_target_cls_names = {j:i for i,j in self.target_cls_names.items()}
-        self.src_cls_names = {i:j for i,j in enumerate(self.seg_yaml["names"])}
+        self.src_cls_names = pastein_dataset.data["names"]
         self.imgsz_factor = imgsz_factor
+        self.debug = False
 
     def upper_left_crop(self, image, crop_width, crop_height):
         h, w, _ = image.shape
@@ -1717,9 +1715,6 @@ class PasteIn:
         Returns:
             (Dict): Dictionary with augmented image and updated instances under 'img', 'cls', and 'instances' keys.
         """
-        # for debugging
-        self.debug = False
-
         # unpack labels
         im = labels["img"]
         cls = labels["cls"]
@@ -1809,29 +1804,20 @@ class PasteIn:
             for j in random.sample(list(indexes), k=round(self.p * n)):
                 cls = np.concatenate((cls, src_cls[[j]]), axis=0)
                 cv2.drawContours(im_new, src_instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
-                # print("instances.segments", instances.segments)
                 instances = Instances.concatenate((instances, src_instances[[j]]), axis=0)
 
             result = src_im
             i = im_new.astype(bool)
             im[i] = result[i]
         
-        # TODO remove
-        # plt.imsave(Path("temp") / Path(labels["im_file"]).name, im[:,:,::-1])
         self.imshow(im)
 
         # # assign stufss back to labels object
         labels["img"] = im
         labels["cls"] = cls
-        # print("b4 segment erase len", len(instances.segments), type(instances.segments), instances.segments.shape)
         instances.segments = np.empty(instances_segment_shape)
-        # print("after segment erase len", len(instances.segments), type(instances.segments), instances.segments.shape)
-        # assert len(instances) == len(cls)
-        # instances.normalize(w,h)
-        # instances.convert_bbox(format="xywh")
-
         labels["instances"] = instances
-        # print("pastein return", labels, labels["instances"])
+
         return labels
 
 class CopyPaste:
@@ -2502,8 +2488,9 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False, pastein_dataset=None):
     if pastein_dataset:
         pre_transform_list.insert(2, PasteIn(
             pastein_dataset,
-            p=1.0,
-            imgsz_factor=0.5,
+            target_dataset=dataset,
+            p=hyp.paste_in,
+            imgsz_factor=hyp.paste_in,
             )
         )
 
